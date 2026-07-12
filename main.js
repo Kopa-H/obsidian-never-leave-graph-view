@@ -285,6 +285,7 @@ class GraphNodePreviewPlugin extends Plugin {
 
   onunload() {
     document.body.classList.remove('gnp-editing');
+    document.querySelectorAll('.gnp-graph-pane').forEach((el) => el.removeClass('gnp-graph-pane'));
     this.unpinHighlight();
     for (const t of this.modifyTimers.values()) window.clearTimeout(t);
     this.modifyTimers.clear();
@@ -363,9 +364,15 @@ class GraphNodePreviewPlugin extends Plugin {
   }
 
   hookGraphViews() {
+    // Refresh the graph-pane marks (used by editing-dim to exempt graph
+    // panes without a costly :has()); clear stale ones so a leaf that
+    // stopped being a graph loses the exemption.
+    document.querySelectorAll('.gnp-graph-pane').forEach((el) => el.removeClass('gnp-graph-pane'));
     for (const type of GRAPH_VIEW_TYPES) {
       for (const leaf of this.app.workspace.getLeavesOfType(type)) {
         const view = leaf.view;
+        const leafEl = view && view.containerEl && view.containerEl.closest('.workspace-leaf');
+        if (leafEl) leafEl.addClass('gnp-graph-pane');
         this.addGraphControlButton(view);
         this.ensureFilterHud(view);
         const renderer = view && view.renderer;

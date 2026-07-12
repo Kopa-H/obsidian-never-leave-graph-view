@@ -154,10 +154,11 @@ body.gnp-editing .gnp-header-eye {
   transition: opacity 180ms ease;
 }
 
-/* Graph panes are exempt: they have their own in-canvas spotlight on the
-   edited node, which pane-level dimming would wash out. */
-body.gnp-editing
-  .workspace-leaf:not(.gnp-preview-pane):not(:has(.workspace-leaf-content[data-type='graph'])):not(:has(.workspace-leaf-content[data-type='localgraph'])) {
+/* Graph panes (marked .gnp-graph-pane by the plugin) are exempt: they have
+   their own in-canvas spotlight on the edited node, which pane-level
+   dimming would wash out. A plain marker class avoids :has(), whose broad
+   invalidation is costly on a selector matching every workspace leaf. */
+body.gnp-editing .workspace-leaf:not(.gnp-preview-pane):not(.gnp-graph-pane) {
   opacity: 0.35;
 }
 
