@@ -1,4 +1,4 @@
-# I Will Never Leave the Graph View
+# Never Leave the Graph View
 
 An Obsidian plugin for a graph-first workflow: **preview, edit, and create notes without ever leaving the graph view.**
 
