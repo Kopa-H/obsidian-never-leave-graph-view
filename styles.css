@@ -1,0 +1,197 @@
+/* Obsidian hides all .graph-controls-button by default and only whitelists
+   its own (gear, timelapse) while the settings panel is collapsed; opt our
+   new-note button into the same behavior so it shows beneath them. */
+.graph-controls.is-close .graph-controls-button.gnp-new-note {
+  display: flex;
+  margin-top: var(--size-4-2);
+}
+
+/* While editing, the graph canvas ignores the pointer entirely: no hover
+   can break the pinned spotlight and no stray click swaps the note.
+   Clicking anywhere on the graph (or Esc) ends the editing session. */
+body.gnp-editing .workspace-leaf-content[data-type='graph'] canvas,
+body.gnp-editing .workspace-leaf-content[data-type='localgraph'] canvas {
+  pointer-events: none;
+}
+
+/* Full-pane message overlay: the idle blank state, and the grey-node
+   "not created yet" hint. */
+.gnp-pane-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--size-4-2);
+  padding: var(--size-4-4);
+  background-color: var(--background-primary);
+  text-align: center;
+}
+
+.gnp-pane-overlay .gnp-pane-overlay-title {
+  font-weight: var(--font-semibold);
+  font-size: var(--font-ui-medium);
+  color: var(--text-normal);
+}
+
+.gnp-pane-overlay .gnp-pane-overlay-title.gnp-hidden {
+  display: none;
+}
+
+.gnp-pane-overlay .gnp-pane-overlay-text {
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+  max-width: 24em;
+}
+
+/* Active-filter pill at the bottom center of the graph view. */
+.gnp-filter-hud {
+  position: absolute;
+  bottom: var(--size-4-4);
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 70%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  background-color: var(--background-secondary);
+  padding: var(--size-2-1) var(--size-4-2);
+  border-radius: var(--radius-l);
+  pointer-events: none;
+  z-index: 5;
+}
+
+.gnp-filter-hud.gnp-hud-hidden {
+  display: none;
+}
+
+/* Live eye tab icon; sized like a native tab icon. Overflow stays visible
+   so the lid can dip below the canvas mid-blink, as in the Figma motion. */
+.gnp-eye-svg {
+  width: var(--icon-size, 18px);
+  height: var(--icon-size, 18px);
+  overflow: visible;
+}
+
+/* Blink, ported from the Figma keyframes (motion occupied the first ~20%
+   of a 2s timeline, compressed here to 0.4s):
+   - socket + mask squash vertically to 3.554/12.322 (~29%) about their own
+     center while dropping 4.384px — net effect: the bottom lid holds and
+     the top lid closes down; the eyeball is swallowed by the flattening
+     mask.
+   - the lashes just ride down 3.842px, no squash. */
+.gnp-eye-svg .gnp-lid,
+.gnp-eye-svg .gnp-mask-shape,
+.gnp-eye-svg .gnp-lash {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.gnp-eye-svg.gnp-blink .gnp-lid,
+.gnp-eye-svg.gnp-blink .gnp-mask-shape {
+  animation: gnp-blink-lid 0.4s linear;
+}
+
+.gnp-eye-svg.gnp-blink .gnp-lash {
+  animation: gnp-blink-lash 0.4s linear;
+}
+
+@keyframes gnp-blink-lid {
+  0% {
+    animation-timing-function: cubic-bezier(0, 0.011, 0.137, 1);
+    translate: 0px 0px;
+    scale: 1 1;
+  }
+  50% {
+    animation-timing-function: cubic-bezier(0, 0.824, 1, 1);
+    translate: 0px 4.384px;
+    scale: 1 0.05;
+  }
+  100% {
+    translate: 0px 0px;
+    scale: 1 1;
+  }
+}
+
+@keyframes gnp-blink-lash {
+  0% {
+    animation-timing-function: cubic-bezier(0, 0.01, 0.14, 1);
+    translate: 0px 0px;
+  }
+  50% {
+    animation-timing-function: cubic-bezier(0, 0.82, 1, 1);
+    translate: 0px 7.5px;
+  }
+  100% {
+    translate: 0px 0px;
+  }
+}
+
+/* .gnp-header-eye {
+  display: flex;
+  align-items: center;
+  padding: 0 var(--size-2-2);
+  color: var(--text-muted);
+}
+
+.gnp-header-eye .gnp-eye-svg {
+  width: 28px;
+  height: 28px;
+} */
+
+body.gnp-editing .gnp-header-eye {
+  color: var(--interactive-accent);
+}
+
+
+/* While typing in the graph preview pane, dim every other pane so it's
+   clear where input is going (and that hover updates are paused). */
+.workspace-leaf {
+  transition: opacity 180ms ease;
+}
+
+/* Graph panes are exempt: they have their own in-canvas spotlight on the
+   edited node, which pane-level dimming would wash out. */
+body.gnp-editing
+  .workspace-leaf:not(.gnp-preview-pane):not(:has(.workspace-leaf-content[data-type='graph'])):not(:has(.workspace-leaf-content[data-type='localgraph'])) {
+  opacity: 0.35;
+}
+
+/* Editing orientation: accent border around the pane, an EDITING badge in
+   its header, and an accent-tinted active line in the editor. */
+body.gnp-editing .gnp-preview-pane {
+  opacity: 1;
+  animation: border-glow cubic-bezier(0.77, 0, 0.175, 1) 0.5s;
+  /* box-shadow: inset -0.5px 0 8px 2px var(--interactive-accent); */
+  /* border-radius: var(--radius-s); */
+}
+
+@keyframes border-glow {
+  0% { box-shadow: inset 0px 0 0px 0px var(--interactive-accent); }
+  50% { box-shadow: inset -0.5px 0 20px 2px var(--interactive-accent); }
+  100% { box-shadow: inset 0px 0 0px 0px var(--interactive-accent); }
+}
+
+/* body.gnp-editing .gnp-preview-pane .view-header {
+  position: relative;
+}
+
+body.gnp-editing .gnp-preview-pane .view-header::after {
+  content: 'EDITING';
+  position: absolute;
+  top: 50%;
+  right: var(--size-4-2);
+  transform: translateY(-50%);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 2px 6px;
+  border-radius: var(--radius-s);
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  pointer-events: none;
+} */
