@@ -210,8 +210,21 @@ class GraphNodePreviewPlugin extends Plugin {
     }));
   }
 
+  // Vault notices are part of the graph-first workflow: only speak when a
+  // graph view is open (and never during startup file indexing).
   notifyReady() {
-    return this.app.workspace.layoutReady;
+    return this.app.workspace.layoutReady && this.hasGraphView();
+  }
+
+  focusGraphLeaf() {
+    for (const type of GRAPH_VIEW_TYPES) {
+      const graphLeaf = this.app.workspace.getLeavesOfType(type)[0];
+      if (graphLeaf) {
+        this.app.workspace.setActiveLeaf(graphLeaf, { focus: true });
+        return true;
+      }
+    }
+    return false;
   }
 
   isNote(file) {
@@ -237,7 +250,8 @@ class GraphNodePreviewPlugin extends Plugin {
     if (prev) window.clearTimeout(prev);
     this.modifyTimers.set(file.path, window.setTimeout(() => {
       this.modifyTimers.delete(file.path);
-      new Notice('Modified: ' + file.basename);
+      // The graph may have closed during the debounce window.
+      if (this.notifyReady()) new Notice('Modified: ' + file.basename);
     }, 1200));
   }
 
@@ -892,7 +906,15 @@ class GraphNodePreviewPlugin extends Plugin {
         if (editing) {
           this.scaleUpEditedNode();
         } else {
-          this.onEditingEnded().catch((e) => console.error('graph-node-preview:', e));
+          // Cheap visual teardown immediately; the workspace surgery
+          // (view swap, reclaim, focus moves) waits 200ms so whatever
+          // gesture caused this exit — e.g. a click on the settings gear —
+          // fully lands before we churn the workspace under it.
+          this.scaleDownEditedNode();
+          this.armedPath = null;
+          window.setTimeout(() => {
+            this.onEditingEnded().catch((e) => console.error('graph-node-preview:', e));
+          }, 200);
         }
       }
     });
@@ -902,8 +924,9 @@ class GraphNodePreviewPlugin extends Plugin {
   // the graph, Esc, focus moving to another pane): disarm, reclaim an
   // abandoned empty note, then return everything to the idle blank state.
   async onEditingEnded() {
-    this.scaleDownEditedNode();
-    this.armedPath = null;
+    // Deferred from the exit transition; a new edit may have started in
+    // the meantime — leave it alone (visual teardown already happened).
+    if (this.wasEditing || this.armedPath) return;
     try {
       // Read the abandoned-empty verdict while the file is still open,
       // but blank the pane BEFORE deleting: a file that isn't open in any
@@ -942,6 +965,21 @@ class GraphNodePreviewPlugin extends Plugin {
     if (leaf.containerEl && active && leaf.containerEl.contains(active)) {
       active.blur();
     }
+    // Don't leave the emptied pane as the active leaf (an empty view
+    // swallows leaf-scoped hotkeys) — but wait for the gesture that caused
+    // this exit to land first, and yield if anything else claimed focus
+    // (e.g. the user clicked the settings gear and a modal opened; stealing
+    // focus mid-click would eat that click).
+    window.setTimeout(() => {
+      if (this.wasEditing || this.armedPath) return;
+      const active = document.activeElement;
+      const focusIsLoose = !active
+        || active === document.body
+        || (leaf.containerEl && leaf.containerEl.contains(active));
+      if (focusIsLoose && this.app.workspace.activeLeaf === leaf) {
+        this.focusGraphLeaf();
+      }
+    }, 150);
     this.showBlankState();
     this.updateDimming();
   }
@@ -1331,13 +1369,7 @@ class GraphNodePreviewPlugin extends Plugin {
 
   finishEditing() {
     this.blurPreviewPane();
-    for (const type of GRAPH_VIEW_TYPES) {
-      const graphLeaf = this.app.workspace.getLeavesOfType(type)[0];
-      if (graphLeaf) {
-        this.app.workspace.setActiveLeaf(graphLeaf, { focus: true });
-        break;
-      }
-    }
+    this.focusGraphLeaf();
     this.updateDimming();
   }
 
