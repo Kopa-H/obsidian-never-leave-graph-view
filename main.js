@@ -72,6 +72,10 @@ class GraphNodePreviewPlugin extends Plugin {
     // they are removed again and the node reverts to unresolved.
     this.createdNotes = new Map();
     this.pendingFilterRestore = null;
+    // Plugin-created notes not yet "committed" (given real content or a
+    // title); their create/delete notices are suppressed as churn.
+    this.pendingStubs = new Set();
+    this.modifyTimers = new Map();
     this.settings = (await this.loadData()) || {};
 
     addIcon(ICON_ID, ICON_SVG);
@@ -185,9 +189,56 @@ class GraphNodePreviewPlugin extends Plugin {
     // pointer; clear it so nothing gets re-armed.
     this.registerEvent(this.app.vault.on('delete', (file) => {
       if (this.armedPath === file.path) this.armedPath = null;
+      // A still-pending stub is a plugin throwaway (abandoned empty note):
+      // its deletion is silent.
+      const wasStub = this.pendingStubs.delete(file.path);
       this.createdNotes.delete(file.path);
       this.clearGraphHover();
+      if (this.notifyReady() && this.isNote(file) && !wasStub) {
+        new Notice('Deleted: ' + file.basename);
+      }
     }));
+    this.registerEvent(this.app.vault.on('create', (file) => {
+      // Startup fires create for every existing file; only real, non-stub
+      // creations get announced.
+      if (this.notifyReady() && this.isNote(file) && !this.pendingStubs.has(file.path)) {
+        new Notice('New note: ' + file.basename);
+      }
+    }));
+    this.registerEvent(this.app.vault.on('modify', (file) => {
+      this.onVaultModify(file);
+    }));
+  }
+
+  notifyReady() {
+    return this.app.workspace.layoutReady;
+  }
+
+  isNote(file) {
+    return file instanceof TFile && file.extension === 'md';
+  }
+
+  async onVaultModify(file) {
+    if (!this.notifyReady() || !this.isNote(file)) return;
+    // A plugin stub becomes a real note the moment its content goes beyond
+    // what we seeded — announce it then (not on the empty create), and let
+    // later edits fall through to the debounced "Modified" notice.
+    if (this.pendingStubs.has(file.path)) {
+      const entry = this.createdNotes.get(file.path);
+      let content = '';
+      try { content = await this.app.vault.cachedRead(file); } catch (e) { /* ignore */ }
+      if (content.trim() !== ((entry && entry.initial) || '').trim()) {
+        this.pendingStubs.delete(file.path);
+        new Notice('New note: ' + file.basename);
+      }
+      return;
+    }
+    const prev = this.modifyTimers.get(file.path);
+    if (prev) window.clearTimeout(prev);
+    this.modifyTimers.set(file.path, window.setTimeout(() => {
+      this.modifyTimers.delete(file.path);
+      new Notice('Modified: ' + file.basename);
+    }, 1200));
   }
 
   // Migrate armed/spotlight/created state to a note's new path and re-pin
@@ -216,8 +267,11 @@ class GraphNodePreviewPlugin extends Plugin {
     }
 
     // Renaming commits the note: it's deliberate now, no longer an
-    // auto-reclaim candidate.
+    // auto-reclaim candidate. Titling a stub is its "created" moment.
     this.createdNotes.delete(oldPath);
+    if (this.pendingStubs.delete(oldPath) && this.notifyReady()) {
+      new Notice('New note: ' + file.basename);
+    }
 
     this.armedPath = newPath;
     if (this.scaledNode && this.scaledNode.nodeId === oldPath) {
@@ -232,6 +286,8 @@ class GraphNodePreviewPlugin extends Plugin {
   onunload() {
     document.body.classList.remove('gnp-editing');
     this.unpinHighlight();
+    for (const t of this.modifyTimers.values()) window.clearTimeout(t);
+    this.modifyTimers.clear();
     for (const anim of this.nodeScaleAnims.values()) cancelAnimationFrame(anim);
     this.nodeScaleAnims.clear();
     if (this.scaledNode) {
@@ -659,7 +715,9 @@ class GraphNodePreviewPlugin extends Plugin {
     for (let i = 1; this.app.vault.getAbstractFileByPath(normalizePath(dir + name + '.md')); i++) {
       name = 'Untitled ' + i;
     }
-    const file = await this.app.vault.create(normalizePath(dir + name + '.md'), initial);
+    const stubPath = normalizePath(dir + name + '.md');
+    this.pendingStubs.add(stubPath);
+    const file = await this.app.vault.create(stubPath, initial);
 
     const renderer = view && view.renderer;
     let pos = posOverride || null;
@@ -766,6 +824,7 @@ class GraphNodePreviewPlugin extends Plugin {
         await this.ensureFolderPath(parentDir);
       }
       const initial = this.conformSeed(conform, linktext);
+      this.pendingStubs.add(path);
       file = await this.app.vault.create(path, initial);
       this.createdNotes.set(file.path, { linktext, renderer, pos, initial });
       if (prev) this.pendingFilterRestore = { engine, prev, path: file.path };
