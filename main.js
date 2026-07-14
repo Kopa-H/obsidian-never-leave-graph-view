@@ -1,8 +1,19 @@
 'use strict';
 
-const { Plugin, TFile, Notice, Menu, Keymap, addIcon, setIcon, setTooltip, normalizePath } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, TFile, Notice, Menu, Keymap, addIcon, setIcon, setTooltip, normalizePath } = require('obsidian');
 
 const GRAPH_VIEW_TYPES = ['graph', 'localgraph'];
+const DEFAULT_SETTINGS = {
+  leafId: null,
+  allowGraphInteraction: true,
+  cursorAtStart: true,
+  exitOnEmptyCanvasClick: true,
+  graphHoverOverridesFocus: true,
+  focusGraphFromPreviewLinks: true,
+  openPreviewLinksInConnectedEditor: true,
+  dimNonPreviewPanes: false,
+  showModificationNotices: false,
+};
 
 // The source artwork is on a 24x24 canvas; wrap each so it fills Obsidian's
 // expected 0 0 100 100 viewBox (uniform scale 100/24) and inherits color.
@@ -64,6 +75,9 @@ class GraphNodePreviewPlugin extends Plugin {
     this.previewLeaf = null;
     this.opening = false;
     this.locked = false;
+    this.editRequestId = 0;
+    this.hookedDocuments = new Set();
+    this.previewLinkHoverPath = null;
     // The path a node was *clicked* to edit (persists until editing ends).
     // Hovering is transient; only an armed note stays shown in the pane.
     this.armedPath = null;
@@ -76,10 +90,11 @@ class GraphNodePreviewPlugin extends Plugin {
     // title); their create/delete notices are suppressed as churn.
     this.pendingStubs = new Set();
     this.modifyTimers = new Map();
-    this.settings = (await this.loadData()) || {};
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, (await this.loadData()) || {});
 
     addIcon(ICON_ID, ICON_SVG);
     addIcon(NEW_NOTE_ICON_ID, NEW_NOTE_ICON_SVG);
+    this.addSettingTab(new GraphNodePreviewSettingsTab(this.app, this));
 
     this.addCommand({
       id: 'open-panel',
@@ -105,19 +120,7 @@ class GraphNodePreviewPlugin extends Plugin {
 
     // Dim everything but the preview pane while the user is typing in it,
     // so it's obvious where input is going and that hover updates are paused.
-    this.registerDomEvent(document, 'focusin', () => this.updateDimming());
-    this.registerDomEvent(document, 'focusout', () => this.updateDimming());
-
-    // Esc while editing in the preview pane = Done.
-    this.registerDomEvent(document, 'keydown', (evt) => {
-      if (evt.key !== 'Escape') return;
-      const leaf = this.previewLeaf;
-      if (this.isLeafAlive(leaf)
-          && leaf.containerEl
-          && leaf.containerEl.contains(document.activeElement)) {
-        this.finishEditing();
-      }
-    });
+    this.hookDocument(document);
 
     // The pane's tab icon is a little eye whose pupil follows the pointer.
     this.lastPointer = null;
@@ -216,6 +219,46 @@ class GraphNodePreviewPlugin extends Plugin {
     return this.app.workspace.layoutReady && this.hasGraphView();
   }
 
+  async saveSettings() {
+    await this.saveData(this.settings);
+    if (!this.settings.focusGraphFromPreviewLinks) this.clearPreviewLinkFocus();
+    if (!this.settings.graphHoverOverridesFocus) {
+      for (const { renderer } of this.patchedRenderers) {
+        if (!renderer.__gnpHoverNode) continue;
+        renderer.__gnpHoverNode = null;
+        renderer.highlightNode = renderer.__gnpPreviewLinkNode || renderer.__gnpPinnedNode || null;
+        if (renderer.changed) renderer.changed();
+      }
+    }
+    this.updateDimming();
+  }
+
+  // Pop-out windows have their own Document and activeElement. Listen in
+  // every document that contains one of our panes so focus state is accurate.
+  hookDocument(doc) {
+    if (!doc || this.hookedDocuments.has(doc)) return;
+    this.hookedDocuments.add(doc);
+    this.registerDomEvent(doc, 'focusin', () => this.updateDimming());
+    this.registerDomEvent(doc, 'focusout', () => this.updateDimming());
+    this.registerDomEvent(doc, 'mouseover', (evt) => this.handlePreviewLinkOver(evt));
+    this.registerDomEvent(doc, 'mouseout', (evt) => this.handlePreviewLinkOut(evt));
+    this.registerDomEvent(doc, 'click', (evt) => this.handlePreviewLinkClick(evt), { capture: true });
+    this.registerDomEvent(doc, 'keydown', (evt) => {
+      if (evt.key !== 'Escape') return;
+      const leaf = this.previewLeaf;
+      if (this.isLeafAlive(leaf)
+          && leaf.containerEl
+          && leaf.containerEl.contains(this.activeElementFor(leaf))) {
+        this.finishEditing();
+      }
+    });
+  }
+
+  activeElementFor(leaf) {
+    const doc = leaf && leaf.containerEl && leaf.containerEl.ownerDocument;
+    return doc ? doc.activeElement : document.activeElement;
+  }
+
   focusGraphLeaf() {
     for (const type of GRAPH_VIEW_TYPES) {
       const graphLeaf = this.app.workspace.getLeavesOfType(type)[0];
@@ -235,7 +278,7 @@ class GraphNodePreviewPlugin extends Plugin {
     if (!this.notifyReady() || !this.isNote(file)) return;
     // A plugin stub becomes a real note the moment its content goes beyond
     // what we seeded — announce it then (not on the empty create), and let
-    // later edits fall through to the debounced "Modified" notice.
+    // other modifications follow the notification preference below.
     if (this.pendingStubs.has(file.path)) {
       const entry = this.createdNotes.get(file.path);
       let content = '';
@@ -246,11 +289,11 @@ class GraphNodePreviewPlugin extends Plugin {
       }
       return;
     }
+    if (!this.settings.showModificationNotices) return;
     const prev = this.modifyTimers.get(file.path);
     if (prev) window.clearTimeout(prev);
     this.modifyTimers.set(file.path, window.setTimeout(() => {
       this.modifyTimers.delete(file.path);
-      // The graph may have closed during the debounce window.
       if (this.notifyReady()) new Notice('Modified: ' + file.basename);
     }, 1200));
   }
@@ -298,10 +341,13 @@ class GraphNodePreviewPlugin extends Plugin {
   }
 
   onunload() {
-    document.body.classList.remove('gnp-editing');
-    document.querySelectorAll('.gnp-graph-pane').forEach((el) => el.removeClass('gnp-graph-pane'));
+    for (const doc of this.hookedDocuments) {
+      if (doc.body) doc.body.classList.remove('gnp-editing');
+      if (doc.body) doc.body.classList.remove('gnp-graph-interactive', 'gnp-dim-non-preview');
+      doc.querySelectorAll('.gnp-graph-pane').forEach((el) => el.removeClass('gnp-graph-pane'));
+    }
     this.unpinHighlight();
-    for (const t of this.modifyTimers.values()) window.clearTimeout(t);
+    for (const timer of this.modifyTimers.values()) window.clearTimeout(timer);
     this.modifyTimers.clear();
     for (const anim of this.nodeScaleAnims.values()) cancelAnimationFrame(anim);
     this.nodeScaleAnims.clear();
@@ -336,10 +382,13 @@ class GraphNodePreviewPlugin extends Plugin {
       }
       if (renderer.__gnpHighlightPatched) {
         renderer.__gnpPinnedNode = null;
+        renderer.__gnpHoverNode = null;
+        renderer.__gnpPreviewLinkNode = null;
         delete renderer.highlightNode;
         renderer.highlightNode = null;
         renderer.__gnpHighlightPatched = false;
       }
+      delete renderer.__gnpLiveHoverNodeId;
     }
     this.patchedRenderers = [];
   }
@@ -381,10 +430,14 @@ class GraphNodePreviewPlugin extends Plugin {
     // Refresh the graph-pane marks (used by editing-dim to exempt graph
     // panes without a costly :has()); clear stale ones so a leaf that
     // stopped being a graph loses the exemption.
-    document.querySelectorAll('.gnp-graph-pane').forEach((el) => el.removeClass('gnp-graph-pane'));
+    for (const doc of this.hookedDocuments) {
+      doc.querySelectorAll('.gnp-graph-pane').forEach((el) => el.removeClass('gnp-graph-pane'));
+    }
     for (const type of GRAPH_VIEW_TYPES) {
       for (const leaf of this.app.workspace.getLeavesOfType(type)) {
         const view = leaf.view;
+        const viewDoc = view && view.containerEl && view.containerEl.ownerDocument;
+        this.hookDocument(viewDoc);
         const leafEl = view && view.containerEl && view.containerEl.closest('.workspace-leaf');
         if (leafEl) leafEl.addClass('gnp-graph-pane');
         this.addGraphControlButton(view);
@@ -404,24 +457,24 @@ class GraphNodePreviewPlugin extends Plugin {
             .catch(() => {});
         }
         this.patchRenderer(renderer);
-        // Clicking the graph canvas doesn't move keyboard focus, so an
-        // editor left focused in the preview pane would keep hover updates
-        // paused forever. Blur it explicitly when the graph is clicked.
+        // Canvas gestures deliberately leave keyboard focus in the connected
+        // editor; the graph renderer remains interactive independently.
         const el = renderer.interactiveEl;
         if (el && !this.hookedEls.has(el)) {
           this.hookedEls.add(el);
-          // Listen on the pane container, not the canvas: while editing the
-          // canvas is pointer-inert, and the click passing through to the
-          // container is what ends the editing session.
-          this.registerDomEvent(view.contentEl || el, 'pointerdown', () => this.blurPreviewPane());
-          // Right-click on empty canvas: offer to create a note right there.
-          // (Right-clicks on nodes keep Obsidian's native node menu.)
+          // A left click on empty canvas exits the current edit. Use click
+          // rather than pointerdown so a drag to pan leaves the note open.
+          this.registerDomEvent(el, 'click', (evt) => {
+            if (!this.settings.exitOnEmptyCanvasClick
+                || evt.button !== 0 || renderer.__gnpLiveHoverNodeId) return;
+            if (this.armedPath || this.wasEditing) this.finishEditing();
+          });
+          // Right-click on empty canvas keeps the existing "new note here"
+          // menu; right-clicks on nodes keep Obsidian's native node menu.
           this.registerDomEvent(el, 'contextmenu', (evt) => {
             const r = view.renderer;
-            if (!r || r.highlightNode) return;
+            if (!r || r.__gnpLiveHoverNodeId) return;
             evt.preventDefault();
-            const rect = el.getBoundingClientRect();
-            if (rect.width === 0) return;
             // The right-button pointerdown started a pan; the context menu
             // swallows the pointerup that would end it, leaving the graph
             // glued to the cursor. End the gesture ourselves.
@@ -434,7 +487,10 @@ class GraphNodePreviewPlugin extends Plugin {
               pointerType: 'mouse',
             };
             el.dispatchEvent(new PointerEvent('pointerup', upInit));
-            window.dispatchEvent(new PointerEvent('pointerup', upInit));
+            const graphWindow = el.ownerDocument.defaultView || window;
+            graphWindow.dispatchEvent(new PointerEvent('pointerup', upInit));
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0) return;
             // The renderer's own space is CSS px * devicePixelRatio (see
             // its zoomCenter math), so convert the click the same way.
             const dpr = window.devicePixelRatio || 1;
@@ -471,6 +527,8 @@ class GraphNodePreviewPlugin extends Plugin {
 
     const wrappedHover = function (event, nodeId, nodeType, ...rest) {
       try {
+        this.__gnpLiveHoverNodeId = nodeId;
+        plugin.overridePinnedHover(this, nodeId, nodeType);
         plugin.handleNodeHover(nodeId, nodeType);
       } catch (e) {
         console.error('graph-node-preview:', e);
@@ -488,6 +546,8 @@ class GraphNodePreviewPlugin extends Plugin {
     const originalUnhover = renderer.onNodeUnhover;
     const wrappedUnhover = function (...args) {
       try {
+        this.__gnpLiveHoverNodeId = null;
+        plugin.restorePinnedHover(this);
         plugin.handleNodeUnhover();
       } catch (e) {
         console.error('graph-node-preview:', e);
@@ -499,12 +559,13 @@ class GraphNodePreviewPlugin extends Plugin {
     wrappedUnhover.__graphNodePreview = true;
     renderer.onNodeUnhover = wrappedUnhover;
 
-    // Clicking a node means "edit it in the preview pane": hover is the
-    // volatile peek, click is the commit. Cmd/Ctrl-click falls through to
-    // Obsidian's default (open in a main tab), and so do tag nodes.
+    // Only a primary-button click edits in the preview pane. Middle-click is
+    // left entirely to the graph so it can be used for free navigation.
+    // Cmd/Ctrl-click falls through to Obsidian's default, as do tag nodes.
     const wrappedClick = function (event, nodeId, nodeType, ...rest) {
       const isMod = event && Keymap.isModEvent && Keymap.isModEvent(event);
-      if (nodeId && !isMod) {
+      const isPrimary = !event || event.button == null || event.button === 0;
+      if (nodeId && isPrimary && !isMod) {
         if (nodeType === 'unresolved') {
           // Remember where the grey node sits so the created note's node
           // can be pinned to the same spot instead of re-laid-out elsewhere.
@@ -859,30 +920,46 @@ class GraphNodePreviewPlugin extends Plugin {
   // moves into the editor, which also pauses hover swaps and turns on the
   // editing orientation (dimming, accent border, badge).
   async editInPreview(file) {
+    // Invalidate any deferred exit belonging to the previously selected note.
+    const editRequestId = ++this.editRequestId;
     const leaf = await this.ensurePreviewLeaf();
-    if (!leaf) return;
+    if (!leaf || editRequestId !== this.editRequestId) return;
+    this.clearPreviewLinkFocus();
     // Clicking commits: this note is armed and stays shown while editing.
+    const previousArmedPath = this.armedPath;
     this.armedPath = file.path;
     await this.maybeReclaimEmptyNote(file.path);
+    if (editRequestId !== this.editRequestId) return;
     const openState = file.extension === 'md'
       ? { active: true, state: { mode: 'source' } }
       : { active: true };
     await this.openInPreview(leaf, file, openState);
+    if (editRequestId !== this.editRequestId) return;
     this.app.workspace.setActiveLeaf(leaf, { focus: true });
     this.app.workspace.revealLeaf(leaf);
     const view = leaf.view;
     if (view && view.editor) {
       view.editor.focus();
-      // Land the cursor after any seeded content, ready to type.
-      const lastLine = view.editor.lastLine();
-      view.editor.setCursor(lastLine, view.editor.getLine(lastLine).length);
+      // Opening and focusing are complete; make this the final cursor move.
+      if (this.settings.cursorAtStart) view.editor.setCursor(0, 0);
+    }
+    // A direct node-to-node switch stays in editing mode, so updateDimming
+    // does not see an enter transition. Refresh the pinned graph spotlight
+    // explicitly instead of leaving the previous node and its neighbors lit.
+    if (this.wasEditing && previousArmedPath !== file.path) {
+      this.scaleUpEditedNode();
     }
     this.updateDimming();
   }
 
   updateDimming() {
-    // Wait a frame so document.activeElement reflects the finished focus move.
+    const editRequestId = this.editRequestId;
+    // Wait a frame so the preview window's activeElement reflects the
+    // finished focus move.
     requestAnimationFrame(() => {
+      // A node click may have started a new edit while a focusout callback
+      // from the previous note was waiting for this frame.
+      if (editRequestId !== this.editRequestId) return;
       const leaf = this.previewLeaf;
       const alive = this.isLeafAlive(leaf);
       // Editing requires BOTH keyboard focus in the pane AND an explicitly
@@ -892,8 +969,13 @@ class GraphNodePreviewPlugin extends Plugin {
       const editing = !!this.armedPath
         && alive
         && leaf.containerEl
-        && leaf.containerEl.contains(document.activeElement);
-      document.body.classList.toggle('gnp-editing', !!editing);
+        && leaf.containerEl.contains(this.activeElementFor(leaf));
+      for (const doc of this.hookedDocuments) {
+        if (!doc.body) continue;
+        doc.body.classList.toggle('gnp-editing', !!editing);
+        doc.body.classList.toggle('gnp-graph-interactive', !!this.settings.allowGraphInteraction);
+        doc.body.classList.toggle('gnp-dim-non-preview', !!this.settings.dimNonPreviewPanes);
+      }
       if (alive && leaf.containerEl) {
         leaf.containerEl.classList.toggle('gnp-preview-pane', !!editing);
       }
@@ -913,43 +995,47 @@ class GraphNodePreviewPlugin extends Plugin {
           this.scaleDownEditedNode();
           this.armedPath = null;
           window.setTimeout(() => {
-            this.onEditingEnded().catch((e) => console.error('graph-node-preview:', e));
+            this.onEditingEnded(editRequestId).catch((e) => console.error('graph-node-preview:', e));
           }, 200);
         }
       }
     });
   }
 
-  // Every editing exit funnels through here, whatever caused it (click on
-  // the graph, Esc, focus moving to another pane): disarm, reclaim an
+  // Every editing exit funnels through here, whatever caused it (Esc or
+  // focus moving to another pane): disarm, reclaim an
   // abandoned empty note, then return everything to the idle blank state.
-  async onEditingEnded() {
+  async onEditingEnded(editRequestId) {
     // Deferred from the exit transition; a new edit may have started in
     // the meantime — leave it alone (visual teardown already happened).
-    if (this.wasEditing || this.armedPath) return;
+    if (editRequestId !== this.editRequestId || this.wasEditing || this.armedPath) return;
     try {
       // Read the abandoned-empty verdict while the file is still open,
       // but blank the pane BEFORE deleting: a file that isn't open in any
       // pane triggers no deleted-file handling — no history restoring the
       // last hovered note into the pane, no pane getting closed.
       const candidate = await this.getReclaimCandidate();
-      await this.blankOutPane();
+      if (editRequestId !== this.editRequestId || this.wasEditing || this.armedPath) return;
+      await this.blankOutPane(editRequestId);
+      if (editRequestId !== this.editRequestId || this.wasEditing || this.armedPath) return;
       if (candidate) await this.reclaimNote(candidate);
+      if (editRequestId !== this.editRequestId || this.wasEditing || this.armedPath) return;
       await this.maybeRestoreGraphFilters();
     } catch (e) {
       console.error('graph-node-preview:', e);
     }
     // If a new edit started while we were busy, leave it alone.
-    if (this.wasEditing || this.armedPath) return;
+    if (editRequestId !== this.editRequestId || this.wasEditing || this.armedPath) return;
     this.clearGraphHover();
   }
 
   // True blank state: no file open in the pane at all. This clears the
   // graph's "open file" accent on the node and prevents the pane's history
   // from resurrecting the previously shown note after a deletion.
-  async blankOutPane() {
+  async blankOutPane(editRequestId) {
     const leaf = this.previewLeaf;
-    if (!this.isLeafAlive(leaf)) return;
+    if (editRequestId !== this.editRequestId || !this.isLeafAlive(leaf)) return;
+    this.clearPreviewLinkFocus();
     if (leaf.view && leaf.view.getViewType() !== 'empty') {
       // Remember the reading/editing mode across the blank gap.
       if (leaf.view.getViewType() === 'markdown' && leaf.view.getState) {
@@ -961,7 +1047,7 @@ class GraphNodePreviewPlugin extends Plugin {
     }
     // The empty view (or its neighbors) must not hold keyboard focus, or
     // we'd still count as "editing".
-    const active = document.activeElement;
+    const active = this.activeElementFor(leaf);
     if (leaf.containerEl && active && leaf.containerEl.contains(active)) {
       active.blur();
     }
@@ -971,10 +1057,11 @@ class GraphNodePreviewPlugin extends Plugin {
     // (e.g. the user clicked the settings gear and a modal opened; stealing
     // focus mid-click would eat that click).
     window.setTimeout(() => {
-      if (this.wasEditing || this.armedPath) return;
-      const active = document.activeElement;
+      if (editRequestId !== this.editRequestId || this.wasEditing || this.armedPath) return;
+      const active = this.activeElementFor(leaf);
+      const doc = leaf.containerEl && leaf.containerEl.ownerDocument;
       const focusIsLoose = !active
-        || active === document.body
+        || (doc && active === doc.body)
         || (leaf.containerEl && leaf.containerEl.contains(active));
       if (focusIsLoose && this.app.workspace.activeLeaf === leaf) {
         this.focusGraphLeaf();
@@ -1032,7 +1119,8 @@ class GraphNodePreviewPlugin extends Plugin {
   // everything else faded) alive while the note is being edited. The
   // renderer clears/reassigns highlightNode from several internal paths, so
   // instead of racing it, highlightNode becomes an accessor that pins to
-  // our node while __gnpPinnedNode is set.
+  // our node while __gnpPinnedNode is set. A live pointer hover temporarily
+  // takes priority, then yields back to the pinned editing node on unhover.
   pinHighlight(target) {
     const { renderer, nodeId } = target;
     const node = renderer.nodeLookup && renderer.nodeLookup[nodeId];
@@ -1043,7 +1131,10 @@ class GraphNodePreviewPlugin extends Plugin {
         configurable: true,
         get() { return current; },
         set(value) {
-          current = renderer.__gnpPinnedNode || value;
+          current = renderer.__gnpPreviewLinkNode
+            || renderer.__gnpHoverNode
+            || renderer.__gnpPinnedNode
+            || value;
         },
       });
       renderer.__gnpHighlightPatched = true;
@@ -1054,10 +1145,91 @@ class GraphNodePreviewPlugin extends Plugin {
     if (renderer.changed) renderer.changed();
   }
 
+  overridePinnedHover(renderer, nodeId, nodeType) {
+    if (!this.settings.graphHoverOverridesFocus
+        || !nodeId || nodeType === 'tag'
+        || !this.pinnedHighlight
+        || this.pinnedHighlight.renderer !== renderer) return;
+    const node = renderer.nodeLookup && renderer.nodeLookup[nodeId];
+    if (!node) return;
+    renderer.__gnpHoverNode = node;
+    renderer.highlightNode = node;
+    if (renderer.changed) renderer.changed();
+  }
+
+  restorePinnedHover(renderer) {
+    if (!renderer.__gnpHoverNode) return;
+    renderer.__gnpHoverNode = null;
+    renderer.highlightNode = renderer.__gnpPinnedNode || null;
+    if (renderer.changed) renderer.changed();
+  }
+
+  previewLinkElement(target) {
+    const leaf = this.previewLeaf;
+    if (!this.isLeafAlive(leaf) || !leaf.containerEl || !target || !target.closest) return null;
+    if (!leaf.containerEl.contains(target)) return null;
+    return target.closest('.internal-link, .cm-hmd-internal-link');
+  }
+
+  handlePreviewLinkOver(evt) {
+    if (!this.settings.focusGraphFromPreviewLinks || !this.armedPath) return;
+    const link = this.previewLinkElement(evt.target);
+    if (!link || this.previewLinkElement(evt.relatedTarget) === link) return;
+    const file = this.previewLinkFile(link);
+    if (!(file instanceof TFile)) return;
+    this.previewLinkHoverPath = file.path;
+    for (const { renderer } of this.patchedRenderers) {
+      const node = renderer.nodeLookup && renderer.nodeLookup[file.path];
+      if (!node) continue;
+      renderer.__gnpPreviewLinkNode = node;
+      renderer.highlightNode = node;
+      if (renderer.changed) renderer.changed();
+    }
+  }
+
+  handlePreviewLinkOut(evt) {
+    const link = this.previewLinkElement(evt.target);
+    if (!link || this.previewLinkElement(evt.relatedTarget) === link) return;
+    this.clearPreviewLinkFocus();
+  }
+
+  previewLinkFile(link) {
+    if (!link) return null;
+    const linktext = link.getAttribute('data-href') || link.getAttribute('href');
+    const leaf = this.previewLeaf;
+    const sourcePath = leaf && leaf.view && leaf.view.file ? leaf.view.file.path : '';
+    const file = linktext && this.app.metadataCache.getFirstLinkpathDest(linktext, sourcePath);
+    return file instanceof TFile ? file : null;
+  }
+
+  handlePreviewLinkClick(evt) {
+    if (!this.settings.openPreviewLinksInConnectedEditor
+        || !this.armedPath
+        || evt.button !== 0
+        || (Keymap.isModEvent && Keymap.isModEvent(evt))) return;
+    const file = this.previewLinkFile(this.previewLinkElement(evt.target));
+    if (!file) return;
+    evt.preventDefault();
+    evt.stopImmediatePropagation();
+    this.editInPreview(file).catch((e) => console.error('graph-node-preview:', e));
+  }
+
+  clearPreviewLinkFocus() {
+    if (!this.previewLinkHoverPath) return;
+    this.previewLinkHoverPath = null;
+    for (const { renderer } of this.patchedRenderers) {
+      if (!renderer.__gnpPreviewLinkNode) continue;
+      renderer.__gnpPreviewLinkNode = null;
+      renderer.highlightNode = renderer.__gnpHoverNode || renderer.__gnpPinnedNode || null;
+      if (renderer.changed) renderer.changed();
+    }
+  }
+
   unpinHighlight() {
     if (!this.pinnedHighlight) return;
     const { renderer } = this.pinnedHighlight;
     this.pinnedHighlight = null;
+    renderer.__gnpHoverNode = null;
     renderer.__gnpPinnedNode = null;
     renderer.highlightNode = null;
     if (renderer.changed) renderer.changed();
@@ -1264,7 +1436,7 @@ class GraphNodePreviewPlugin extends Plugin {
   blurPreviewPane() {
     const leaf = this.previewLeaf;
     if (!this.isLeafAlive(leaf)) return;
-    const active = document.activeElement;
+    const active = this.activeElementFor(leaf);
     if (active && leaf.containerEl && leaf.containerEl.contains(active)) {
       active.blur();
     }
@@ -1328,6 +1500,7 @@ class GraphNodePreviewPlugin extends Plugin {
   async ensurePreviewLeaf(options) {
     const reveal = !options || options.reveal !== false;
     if (this.isLeafAlive(this.previewLeaf)) {
+      this.hookDocument(this.previewLeaf.containerEl && this.previewLeaf.containerEl.ownerDocument);
       this.applyPreviewIcon(this.previewLeaf);
       return this.previewLeaf;
     }
@@ -1337,6 +1510,7 @@ class GraphNodePreviewPlugin extends Plugin {
       const leaf = this.app.workspace.getLeafById(this.settings.leafId);
       if (leaf && leaf.getRoot() === this.app.workspace.rightSplit) {
         this.previewLeaf = leaf;
+        this.hookDocument(leaf.containerEl && leaf.containerEl.ownerDocument);
         this.applyPreviewIcon(leaf);
         return leaf;
       }
@@ -1345,6 +1519,7 @@ class GraphNodePreviewPlugin extends Plugin {
     const leaf = this.app.workspace.getRightLeaf(false);
     if (!leaf) return null;
     this.previewLeaf = leaf;
+    this.hookDocument(leaf.containerEl && leaf.containerEl.ownerDocument);
     this.settings.leafId = leaf.id;
     await this.saveData(this.settings);
     if (reveal) this.app.workspace.revealLeaf(leaf);
@@ -1425,7 +1600,7 @@ class GraphNodePreviewPlugin extends Plugin {
     return !!(this.locked
       || (this.isLeafAlive(leaf)
         && leaf.containerEl
-        && leaf.containerEl.contains(document.activeElement)));
+        && leaf.containerEl.contains(this.activeElementFor(leaf))));
   }
 
   // Pointer left a node onto empty canvas: a transient preview reverts to
@@ -1487,7 +1662,7 @@ class GraphNodePreviewPlugin extends Plugin {
       // command freezes it, and keyboard focus inside it (i.e. actively
       // editing) pauses hover updates until they click back into the graph.
       if (this.locked) return;
-      if (leaf.containerEl && leaf.containerEl.contains(document.activeElement)) return;
+      if (leaf.containerEl && leaf.containerEl.contains(this.activeElementFor(leaf))) return;
 
       await this.maybeReclaimEmptyNote(file.path);
       await this.maybeRestoreGraphFilters();
@@ -1510,6 +1685,71 @@ class GraphNodePreviewPlugin extends Plugin {
     } finally {
       this.opening = false;
     }
+  }
+}
+
+class GraphNodePreviewSettingsTab extends PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    containerEl.createEl('h2', { text: 'Graph Node Preview' });
+    this.addToggle(
+      'Permitir interactuar con el grafo al editar',
+      'Mantiene pan, zoom y selección de nodos activos mientras el panel conectado tiene el foco.',
+      'allowGraphInteraction'
+    );
+    this.addToggle(
+      'Cursor al principio de la nota',
+      'Al abrir una nota desde el grafo, coloca el cursor en la línea 0, columna 0.',
+      'cursorAtStart'
+    );
+    this.addToggle(
+      'Clic vacío para cerrar la nota',
+      'Un clic izquierdo en un espacio vacío del grafo sale del modo de edición.',
+      'exitOnEmptyCanvasClick'
+    );
+    this.addToggle(
+      'Hover de nodo con prioridad visual',
+      'Al pasar sobre otro nodo, muestra temporalmente su foco en lugar del de la nota editada.',
+      'graphHoverOverridesFocus'
+    );
+    this.addToggle(
+      'Enlaces de la nota enfocan el grafo',
+      'Al pasar sobre un enlace interno del panel conectado, enfoca temporalmente su nodo en el grafo.',
+      'focusGraphFromPreviewLinks'
+    );
+    this.addToggle(
+      'Abrir enlaces en el panel conectado',
+      'Un clic izquierdo en un enlace interno abre su nota en este mismo editor.',
+      'openPreviewLinksInConnectedEditor'
+    );
+    this.addToggle(
+      'Atenuar otros paneles al editar',
+      'Recupera la opacidad reducida de los paneles que no son el editor conectado ni el grafo.',
+      'dimNonPreviewPanes'
+    );
+    this.addToggle(
+      'Mostrar avisos al guardar',
+      'Muestra un aviso de modificación después de guardar una nota.',
+      'showModificationNotices'
+    );
+  }
+
+  addToggle(name, desc, key) {
+    new Setting(this.containerEl)
+      .setName(name)
+      .setDesc(desc)
+      .addToggle((toggle) => toggle
+        .setValue(!!this.plugin.settings[key])
+        .onChange(async (value) => {
+          this.plugin.settings[key] = value;
+          await this.plugin.saveSettings();
+        }));
   }
 }
 

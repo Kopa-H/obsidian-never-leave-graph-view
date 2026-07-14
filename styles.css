@@ -6,14 +6,6 @@
   margin-top: var(--size-4-2);
 }
 
-/* While editing, the graph canvas ignores the pointer entirely: no hover
-   can break the pinned spotlight and no stray click swaps the note.
-   Clicking anywhere on the graph (or Esc) ends the editing session. */
-body.gnp-editing .workspace-leaf-content[data-type='graph'] canvas,
-body.gnp-editing .workspace-leaf-content[data-type='localgraph'] canvas {
-  pointer-events: none;
-}
-
 /* Full-pane message overlay: the idle blank state, and the grey-node
    "not created yet" hint. */
 .gnp-pane-overlay {
@@ -67,6 +59,20 @@ body.gnp-editing .workspace-leaf-content[data-type='localgraph'] canvas {
 
 .gnp-filter-hud.gnp-hud-hidden {
   display: none;
+}
+
+/* Optional focus aids, controlled from the plugin settings. */
+body.gnp-editing:not(.gnp-graph-interactive) .workspace-leaf-content[data-type='graph'] canvas,
+body.gnp-editing:not(.gnp-graph-interactive) .workspace-leaf-content[data-type='localgraph'] canvas {
+  pointer-events: none;
+}
+
+.workspace-leaf {
+  transition: opacity 180ms ease;
+}
+
+body.gnp-editing.gnp-dim-non-preview .workspace-leaf:not(.gnp-preview-pane):not(.gnp-graph-pane) {
+  opacity: 0.35;
 }
 
 /* Live eye tab icon; sized like a native tab icon. Overflow stays visible
@@ -147,20 +153,6 @@ body.gnp-editing .gnp-header-eye {
   color: var(--interactive-accent);
 }
 
-
-/* While typing in the graph preview pane, dim every other pane so it's
-   clear where input is going (and that hover updates are paused). */
-.workspace-leaf {
-  transition: opacity 180ms ease;
-}
-
-/* Graph panes (marked .gnp-graph-pane by the plugin) are exempt: they have
-   their own in-canvas spotlight on the edited node, which pane-level
-   dimming would wash out. A plain marker class avoids :has(), whose broad
-   invalidation is costly on a selector matching every workspace leaf. */
-body.gnp-editing .workspace-leaf:not(.gnp-preview-pane):not(.gnp-graph-pane) {
-  opacity: 0.35;
-}
 
 /* Editing orientation: accent border around the pane, an EDITING badge in
    its header, and an accent-tinted active line in the editor. */
